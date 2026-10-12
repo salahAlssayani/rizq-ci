@@ -1,0 +1,336 @@
+name: CI
+
+# PUBLIC CI SHIM — this file runs in salahAlssayani/rizq-ci (public repo).
+# SOURCE OF TRUTH (edit there, never here directly):
+#   salahAlssayani/rizq-saas-v1 -> ci-shim/.github/workflows/ci.yml
+# Sync:   node scripts/sync-ci-shim.mjs          (from the private repo)
+# Trigger: node scripts/sync-ci-shim.mjs --run   (sync + dispatch this workflow)
+# Spec, deltas, security notes: ci-shim/README.md
+#
+# WHY THIS EXISTS: GitHub Free = 2000 private Actions minutes/month,
+# account-wide. The private repo's Oct-2026 quota hit 2121 min -> every
+# native run died at runner allocation (steps=0, no runner, no logs).
+# Public repos run Actions free. This workflow checks out the private repo
+# with the fine-grained PAT stored as secret PRIVATE_REPO_TOKEN
+# (Contents: Read on rizq-saas-v1 only). NEVER add other secrets to this
+# public repo.
+#
+# SHIM DELTAS vs .github/workflows/ci.yml (rationale in ci-shim/README.md):
+#   1. triggers: workflow_dispatch (ref input) + hourly poll +
+#      repository_dispatch instead of push/pull_request — a public repo
+#      cannot see the private repo's events
+#   2. every actions/checkout pins repository/ref/token (the PAT)
+#   3. `changes` job gates all jobs (skip when develop unchanged)
+#   4. `record` job writes last-run.json (poller state), needs contents:write
+#   5. workflow permissions: contents: read (record job overrides to write)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'rizq-saas-v1 ref to test (branch, tag or sha)'
+        required: false
+        default: 'develop'
+  repository_dispatch:
+    types: [ci]  # future bridge from the private repo (needs bridge secret; see README)
+  schedule:
+    - cron: '7,37 * * * *'  # twice hourly — runs only when develop moved
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: salahAlssayani/rizq-saas-v1
+
+jobs:
+  changes:
+    name: Detect develop changes
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      sha: ${{ steps.decide.outputs.sha }}
+      ref: ${{ steps.decide.outputs.ref }}
+    steps:
+      - name: Decide whether to run
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          REF: ${{ inputs.ref || github.event.client_payload.ref || 'develop' }}
+          EVENT: ${{ github.event_name }}
+          RAW_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/last-run.json
+        run: |
+          set -euo pipefail
+          CURRENT=$(gh api "repos/$SOURCE_REPO/git/ref/heads/develop" --jq '.object.sha')
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "develop head: $CURRENT"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "manual dispatch — forcing run"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST=$(curl -sf "$RAW_URL" || echo '{}')
+          LAST_SHA=$(echo "$LAST" | jq -r '.sha // empty')
+          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$CURRENT" ]; then
+            echo "no new commits since last recorded run ($LAST_SHA) — skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "last recorded: ${LAST_SHA:-<none>} — running"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  go-test:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: ${{ needs.changes.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      # SESSION-159: 20m → 25m — internal/handlers alone ran 789.9s (S156);
+      # runner variance over 20m is a real false-fail risk (DOD-03).
+      - name: Go Test
+        run: cd services/api && go test ./... -v -count=1 -timeout 25m -coverprofile=coverage.out -covermode=atomic
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/test?sslmode=disable
+          REDIS_URL: localhost:6379
+      - name: Go Vet
+        run: cd services/api && go vet ./...
+      - name: Coverage Report
+        run: |
+          set -euo pipefail
+          cd services/api
+          go tool cover -func=coverage.out > coverage_report.txt
+          TOTAL=$(tail -n 1 coverage_report.txt | awk '{print $NF}' | tr -d '%')
+          echo "Total coverage: ${TOTAL}% (minimum: ${COVERAGE_MIN}%)"
+          {
+            echo "## Go coverage"
+            echo ""
+            echo "**${TOTAL}%** of statements — minimum gate: ${COVERAGE_MIN}%"
+            echo ""
+            echo '```'
+            head -n 1 coverage_report.txt
+            tail -n 20 coverage_report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          WHOLE=${TOTAL%%.*}
+          if [ "${WHOLE}" -lt "${COVERAGE_MIN}" ]; then
+            echo "::error::Coverage ${TOTAL}% is below the required minimum of ${COVERAGE_MIN}%"
+            exit 1
+          fi
+        env:
+          # Ratchet upward as coverage improves. Target: 80% (DOD-04).
+          # SESSION-143: measured 81.1% full-repo green run (DB tests on; CI
+          # also runs Redis-backed tests, so CI >= local) — ratcheted 50 → 80.
+          COVERAGE_MIN: 80
+      - name: Upload Coverage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: |
+            services/api/coverage.out
+            services/api/coverage_report.txt
+
+  go-build:
+    name: Go Build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: ${{ needs.changes.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Build
+        run: cd services/api && go build -o /dev/null ./cmd/server
+      - name: gofmt (DOD-02)
+        run: |
+          OUT=$(cd services/api && gofmt -l .)
+          if [ -n "$OUT" ]; then
+            echo "::error::gofmt reported unformatted files:"
+            echo "$OUT"
+            exit 1
+          fi
+          echo "gofmt clean (0 files)"
+
+  # SESSION-159 / T-19-01: frontend + repo-script quality gates.
+  # Local equivalents (paste raw output as GEN-04 evidence):
+  #   pnpm lint · pnpm test · 3x mobile typecheck ·
+  #   node scripts/dead-element-scan.mjs · node scripts/security-scan.mjs
+  quality:
+    name: Quality Gates (lint/tests/scans)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks (inside security-scan.mjs) scans full git history (SEC-01).
+          fetch-depth: 0
+          repository: salahAlssayani/rizq-saas-v1
+          ref: ${{ needs.changes.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install pnpm
+        # SESSION-160: pin to the local major — pnpm ≥10 no longer reads
+        # package.json#pnpm.overrides → frozen install dies with
+        # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (run 38177801183).
+        run: npm install -g pnpm@9.15.9
+      - name: Install deps
+        run: pnpm install
+      - name: Install govulncheck + gitleaks (for security-scan)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          # SESSION-160: module path is zricethezav/gitleaks/v8 — the
+          # gitleaks/gitleaks/v8 path fails with a go.mod path conflict.
+          go install github.com/zricethezav/gitleaks/v8@latest
+      - name: Lint (pnpm lint — DOD-02)
+        run: pnpm lint
+      - name: Unit tests (pnpm test — DOD-03)
+        # SESSION-159: workspace-concurrency=1 — parallel vitest×5 OOMs
+        # memory-constrained runners (verified locally: sequential = 655/655 green).
+        run: pnpm --workspace-concurrency=1 test
+      - name: mobile-shared typecheck
+        run: pnpm --filter @rizq/mobile-shared typecheck
+      - name: merchant-mobile typecheck
+        run: pnpm --filter rizq-merchant-mobile typecheck
+      - name: consumer-mobile typecheck
+        run: pnpm --filter rizq-consumer-mobile typecheck
+      - name: Dead-element scan (DOD-05)
+        run: node scripts/dead-element-scan.mjs
+      - name: Security scan (DOD-06 — unified gate w/ exceptions registry)
+        run: node scripts/security-scan.mjs
+
+  typescript-check:
+    name: TypeScript Check
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: ${{ needs.changes.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install pnpm
+        # SESSION-160: pin to the local major — pnpm ≥10 no longer reads
+        # package.json#pnpm.overrides → frozen install dies with
+        # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (run 38177801183).
+        run: npm install -g pnpm@9.15.9
+      - name: Install deps
+        run: pnpm install
+      - name: merchant-web
+        run: cd apps/merchant-web && npx tsc --noEmit
+      - name: consumer-web
+        run: cd apps/consumer-web && npx tsc --noEmit
+      - name: admin-web
+        run: cd apps/admin-web && npx tsc --noEmit
+      - name: main-portal
+        run: cd apps/main-portal && npx tsc --noEmit
+
+  gosec:
+    name: Security Scan (GoSec)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: ${{ needs.changes.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: securego/gosec@master
+        with:
+          args: ./services/api/...
+
+  trivy:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: ${{ needs.changes.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - name: Build Docker image
+        run: cd services/api && docker build -t rizq-api:test .
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'rizq-api:test'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+
+  # Poller state: remember which develop SHA this run tested so the next
+  # scheduled run skips when nothing moved. Only records develop runs
+  # (manual runs of other refs are one-offs and must not clobber state).
+  # Runs even when jobs failed so a broken commit is not retried in a
+  # 30-minute loop — force a retry with workflow_dispatch.
+  record:
+    name: Record tested SHA
+    runs-on: ubuntu-latest
+    needs: [changes, go-test, go-build, quality, typescript-check, gosec, trivy]
+    if: always() && needs.changes.outputs.run == 'true' && needs.changes.outputs.ref == 'develop'
+    permissions:
+      contents: write
+    steps:
+      - name: Write last-run.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.changes.outputs.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BODY=$(printf '{"sha":"%s","run":%s,"tested_at":"%s"}' "$SHA" "$RUN_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          ENC=$(printf '%s' "$BODY" | base64 -w0)
+          CUR=$(gh api "repos/$REPO/contents/last-run.json" --jq '.sha' 2>/dev/null || true)
+          if [ -n "$CUR" ]; then
+            gh api -X PUT "repos/$REPO/contents/last-run.json" \
+              -f message="ci: record $SHA" -f content="$ENC" -f sha="$CUR"
+          else
+            gh api -X PUT "repos/$REPO/contents/last-run.json" \
+              -f message="ci: record $SHA" -f content="$ENC"
+          fi
+          echo "recorded develop@$SHA"
