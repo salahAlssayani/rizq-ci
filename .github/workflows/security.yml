@@ -1,0 +1,307 @@
+name: Security Scan
+
+# PUBLIC CI SHIM — this file runs in salahAlssayani/rizq-ci (public repo).
+# SOURCE OF TRUTH (edit there, never here directly):
+#   salahAlssayani/rizq-saas-v1 -> ci-shim/.github/workflows/security.yml
+# Sync:   node scripts/sync-ci-shim.mjs          (from the private repo)
+# Trigger: gh workflow run security.yml -R salahAlssayani/rizq-ci
+#          (or wait for the weekly Monday 02:00 UTC schedule)
+# Spec, deltas, security notes: ci-shim/README.md
+#
+# WHY THIS EXISTS: GitHub Free = 2000 private Actions minutes/month,
+# account-wide — the private repo's quota was exhausted (Oct 2026:
+# 2121/2000), so native runs died at runner allocation. Public repos run
+# free; this workflow checks out the private repo with the fine-grained
+# PAT in secret PRIVATE_REPO_TOKEN (Contents: Read on rizq-saas-v1 only).
+# NEVER add other secrets to this public repo.
+#
+# SHIM DELTAS vs .github/workflows/security.yml (rationale in ci-shim/README.md):
+#   1. triggers: workflow_dispatch + weekly schedule — a public repo cannot
+#      see the private repo's push/pull_request events (per-change blocking
+#      security gates still run on every develop change via ci.yml quality)
+#   2. every actions/checkout pins repository/ref/token (the PAT)
+#   3. permissions drop security-events: write — publishing SARIF to THIS
+#      public repo would expose private source snippets in its Security tab
+#   4. all upload-sarif + archive-artifact steps dropped (SARIF artifacts
+#      are publicly downloadable on a public repo = private code exposure)
+#   5. gitleaks-action@v2 replaced with plain `gitleaks detect --redact`
+#      and TruffleHog gains --redact — job logs are public, findings must
+#      never print raw secret material
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly Monday 2am UTC
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_REPO: salahAlssayani/rizq-saas-v1
+
+jobs:
+  # ── SAST: Static Application Security Testing ──────────────────────────
+  sast:
+    name: SAST (Static Application Security Testing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Run Semgrep SAST
+        # SESSION-160: p/typescript-react 404s on semgrep.dev (killed the whole
+        # job since 62cb1cb) and semgrep-action@v1 has no generateSarif input,
+        # so no semgrep.sarif was ever produced. Plain `semgrep scan` with live
+        # packs; exit !=0 only on tool/config errors (findings are advisory).
+        run: |
+          pipx install semgrep
+          export PATH="$HOME/.local/bin:$PATH"
+          semgrep scan \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/golang \
+            --config p/typescript \
+            --sarif --output semgrep.sarif --quiet
+
+      # SHIM DELTA: upload-sarif + artifact archive intentionally omitted —
+      # see header. semgrep.sarif stays local to the runner and dies with it.
+
+  # ── Dependency Vulnerability Scan ──────────────────────────────────────
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Go Module Audit (govulncheck)
+        working-directory: services/api
+        run: govulncheck ./...
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: NPM Audit (merchant-web)
+        working-directory: apps/merchant-web
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: NPM Audit (consumer-web)
+        working-directory: apps/consumer-web
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: NPM Audit (main-portal)
+        working-directory: apps/main-portal
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: NPM Audit (admin-web)
+        working-directory: apps/admin-web
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+  # ── Secret Scanning ───────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Run Gitleaks
+        # SHIM DELTA (public logs): plain gitleaks with --redact instead of
+        # gitleaks/gitleaks-action@v2 — same blocking semantics (exit 1 on
+        # findings), but findings can never print raw secret material into a
+        # public job log. Same install path the quality gate uses (S160).
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@latest
+          "$(go env GOPATH)/bin/gitleaks" detect --redact -v --source .
+
+      - name: Run TruffleHog (additional)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # SHIM DELTA: --redact — public logs must never print raw secrets.
+          extra_args: --only-verified --redact
+
+  # ── Container Security Scan ───────────────────────────────────────────
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Build Docker image
+        run: docker build -t rizq-api:scan .
+        working-directory: services/api
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: rizq-api:scan
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      # SHIM DELTA: upload-sarif intentionally omitted — see header.
+
+      - name: Trivy table summary
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: rizq-api:scan
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+  # ── Go Security (gosec + govulncheck) ─────────────────────────────────
+  go-security:
+    name: Go Security (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Run gosec
+        # SESSION-160: securego/gosec@master ignores working-directory (valid
+        # inputs: entryPoint, args) and its sarif never landed at the upload
+        # path. Run the binary from services/api; exit 1 = findings (advisory
+        # per Security Gate), exit >1 = tool error (real failure).
+        working-directory: services/api
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          set +e
+          gosec -fmt sarif -out gosec-results.sarif ./...
+          rc=$?
+          set -e
+          if [ "$rc" -gt 1 ]; then
+            echo "gosec tool error (exit $rc)"
+            exit "$rc"
+          fi
+          echo "gosec completed (exit $rc — findings are advisory)"
+
+      # SHIM DELTA: upload-sarif + archive-artifact intentionally omitted —
+      # see header. gosec-results.sarif stays local to the runner.
+
+  # ── License Compliance ────────────────────────────────────────────────
+  license-compliance:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Check Go licenses
+        working-directory: services/api
+        run: |
+          go install github.com/google/go-licenses@latest
+          go-licenses report ./... 2>/dev/null || echo "License report generated"
+          go-licenses csv ./... 2>/dev/null > /tmp/go-licenses.csv || true
+          echo "=== Go License Summary ==="
+          if [ -f /tmp/go-licenses.csv ]; then
+            awk -F',' '{print $4}' /tmp/go-licenses.csv | sort | uniq -c | sort -rn
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check NPM licenses (merchant-web)
+        working-directory: apps/merchant-web
+        run: |
+          npx license-checker --summary --failOn "GPL-3.0;AGPL-3.0" 2>/dev/null || \
+            echo "License check completed (non-critical)"
+
+  # ── Security Gate ─────────────────────────────────────────────────────
+  security-gate:
+    name: Security Gate
+    needs: [sast, dependency-scan, secret-scan, container-scan, go-security, license-compliance]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Evaluate security gate
+        run: |
+          echo "=== Security Gate Results ==="
+          echo "SAST:              ${{ needs.sast.result }}"
+          echo "Dependency Scan:   ${{ needs.dependency-scan.result }}"
+          echo "Secret Scan:       ${{ needs.secret-scan.result }}"
+          echo "Container Scan:    ${{ needs.container-scan.result }}"
+          echo "Go Security:       ${{ needs.go-security.result }}"
+          echo "License Compliance:${{ needs.license-compliance.result }}"
+          echo ""
+
+          # Hard failures: SAST, Secret Scan, Container Scan must pass
+          # Soft failures: dependency-scan, go-security, license-compliance are advisory
+          if [ "${{ needs.sast.result }}" == "failure" ]; then
+            echo "❌ SAST scan FAILED — blocking merge"
+            exit 1
+          fi
+          if [ "${{ needs.secret-scan.result }}" == "failure" ]; then
+            echo "❌ Secret scan FAILED — blocking merge"
+            exit 1
+          fi
+          if [ "${{ needs.container-scan.result }}" == "failure" ]; then
+            echo "❌ Container scan FAILED — blocking merge"
+            exit 1
+          fi
+
+          # Advisory: log warnings but don't block
+          if [ "${{ needs.dependency-scan.result }}" == "failure" ]; then
+            echo "⚠️ Dependency scan found vulnerabilities (advisory)"
+          fi
+          if [ "${{ needs.go-security.result }}" == "failure" ]; then
+            echo "⚠️ gosec found issues (advisory)"
+          fi
+          if [ "${{ needs.license-compliance.result }}" == "failure" ]; then
+            echo "⚠️ License compliance issues found (advisory)"
+          fi
+
+          echo "✅ Security gate PASSED"
