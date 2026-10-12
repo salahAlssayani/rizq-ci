@@ -34,6 +34,9 @@ on:
   repository_dispatch:
     types: [ci]  # future bridge from the private repo (needs bridge secret; see README)
   schedule:
+    # session-162 kick: this comment re-touches the file via git push —
+    # schedules created purely through the Contents API did not fire at the
+    # 21:07/21:37/22:07 UTC ticks; git pushes always (re)register cron.
     - cron: '7,37 * * * *'  # twice hourly — runs only when develop moved
 
 permissions:
