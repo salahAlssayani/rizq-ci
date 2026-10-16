@@ -91,11 +91,20 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          # REST upload requires gzip-then-base64 (NOT the raw file) and has
+          # NO category param — analyze already embedded the category in the
+          # SARIF. Evidence: run 38915738216 analysis OK, upload 422
+          # ("category" not a permitted key).
+          SARIF_B64=$(gzip -c "$GITHUB_WORKSPACE/../results/${{ matrix.language }}.sarif" | base64 -w0)
+          jq -n \
+            --arg commit_sha "$SHA" \
+            --arg ref "refs/heads/main" \
+            --arg checkout_uri "https://github.com/${{ github.repository }}" \
+            --arg tool_name "CodeQL" \
+            --arg sarif "$SARIF_B64" \
+            '{commit_sha: $commit_sha, ref: $ref, checkout_uri: $checkout_uri, tool_name: $tool_name, sarif: $sarif}' \
+            > /tmp/sarif-upload.json
           gh api -X POST "repos/${{ github.repository }}/code-scanning/sarifs" \
-            -F commit_sha="$SHA" \
-            -F ref=refs/heads/main \
-            -F category="/language:${{ matrix.language }}" \
-            -F checkout_uri="https://github.com/${{ github.repository }}" \
-            -F sarif=@"$GITHUB_WORKSPACE/../results/${{ matrix.language }}.sarif" \
+            --input /tmp/sarif-upload.json \
             --jq '.id,.url'
           echo "SARIF uploaded for ${{ matrix.language }} at rizq-ci@$SHA"
