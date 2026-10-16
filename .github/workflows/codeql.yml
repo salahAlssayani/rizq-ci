@@ -1,0 +1,81 @@
+name: CodeQL Analysis
+
+# PUBLIC CI SHIM — this file runs in salahAlssayani/rizq-ci (public repo).
+# SOURCE OF TRUTH (edit there, never here directly):
+#   salahAlssayani/rizq-saas-v1 -> ci-shim/.github/workflows/codeql.yml
+# Sync:   node scripts/sync-ci-shim.mjs          (from the private repo)
+# Trigger: gh workflow run codeql.yml -R salahAlssayani/rizq-ci
+#          (or wait for the weekly Monday 05:00 UTC schedule)
+# Spec, deltas, security notes: ci-shim/README.md
+#
+# WHY THIS EXISTS (P2, session-165, COM-01): the native private-repo CodeQL
+# workflow failed with "Resource not accessible by integration" since
+# 2026-09-21 — GitHub CodeQL needs GHAS on a PRIVATE repo, which this
+# account does not have. Public repos get CodeQL for free, so the analysis
+# is moved here: checkout the private code with the fine-grained PAT
+# (secret PRIVATE_REPO_TOKEN, Contents: Read on rizq-saas-v1 only).
+# NEVER add other secrets to this public repo.
+#
+# SHIM DELTAS vs .github/workflows/codeql.yml (rationale in ci-shim/README.md):
+#   1. triggers: workflow_dispatch + weekly schedule — a public repo cannot
+#      see the private repo's push/pull_request events
+#   2. every actions/checkout pins repository/ref/token (the PAT)
+#   3. permissions KEEP security-events: write (deliberate inversion of the
+#      security.yml delta): SARIF is uploaded to THIS repo's Security tab.
+#      SECURITY NOTE (user-accepted, session-165): alert messages + file
+#      paths/lines of the private codebase become visible in a PUBLIC
+#      Security tab. Source snippets are not rendered (the analysed files
+#      are not committed to this repo), but messages may quote small code
+#      fragments. This exposure was explicitly accepted by the repo owner
+#      on 2026-10-16; do not re-deny without a COM-01 question.
+#   4. setup-go step added before autobuild (Go extraction needs a go
+#      toolchain; the native runner image drifts)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 1'  # Weekly Monday 5am UTC (native was 04:00; shim security.yml is 02:00)
+
+permissions:
+  contents: read
+  security-events: write  # DELTA: kept on purpose — see header note 3
+
+env:
+  SOURCE_REPO: salahAlssayani/rizq-saas-v1
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['go', 'javascript']
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: salahAlssayani/rizq-saas-v1
+          ref: develop
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          upload: true
