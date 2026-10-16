@@ -30,6 +30,11 @@ name: CodeQL Analysis
 #      on 2026-10-16; do not re-deny without a COM-01 question.
 #   4. setup-go step added before autobuild (Go extraction needs a go
 #      toolchain; the native runner image drifts)
+#   5. analyze runs with upload:false + a REST upload step — the built-in
+#      upload 404s with "commit not found" because the workspace HEAD is
+#      the PRIVATE repo's develop SHA, which does not exist in this repo.
+#      The REST call attaches the SARIF to rizq-ci's main HEAD instead
+#      (run 38912503032 proved analysis+export fine, upload 404).
 
 on:
   workflow_dispatch:
@@ -78,4 +83,19 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"
-          upload: true
+          upload: false  # SHIM DELTA 5: built-in upload 404s (private SHA not in this repo)
+
+      - name: Upload SARIF to rizq-ci Security tab (commit mapped to main HEAD)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          gh api -X POST "repos/${{ github.repository }}/code-scanning/sarifs" \
+            -F commit_sha="$SHA" \
+            -F ref=refs/heads/main \
+            -F category="/language:${{ matrix.language }}" \
+            -F checkout_uri="https://github.com/${{ github.repository }}" \
+            -F sarif=@"$GITHUB_WORKSPACE/../results/${{ matrix.language }}.sarif" \
+            --jq '.id,.url'
+          echo "SARIF uploaded for ${{ matrix.language }} at rizq-ci@$SHA"
